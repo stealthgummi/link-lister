@@ -1,0 +1,12 @@
+{
+  "name": "linklister-api",
+  "version": "1.0.0",
+  "description": "Stripe license verification API for Link Lister",
+  "main": "api/verify-license.js",
+  "scripts": {
+    "start": "node api/verify-license.js"
+  },
+  "dependencies": {
+    "stripe": "^14.14.0"
+  }
+}
