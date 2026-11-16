@@ -1,72 +1,47 @@
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-// Allow CORS for the Chrome Extension
+// Only purchases of this product unlock Link Lister Pro. Every other purchase on the
+// Stripe account (books, services, etc.) is rejected.
+const PRO_PRODUCT_ID = process.env.LINKLISTER_PRODUCT_ID || 'prod_UdVP4uXa0v0DDY';
+
 const allowCors = fn => async (req, res) => {
-  res.setHeader('Access-Control-Allow-Credentials', true);
-  res.setHeader('Access-Control-Allow-Origin', '*'); // Or restrict to your extension ID
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
-  );
-  if (req.method === 'OPTIONS') {
-    res.status(200).end();
-    return;
-  }
-  return await fn(req, res);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  return fn(req, res);
 };
 
-const handler = async (req, res) => {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ active: false, error: 'Method not allowed' });
+async function sessionHasPro(sessionId) {
+  const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ['line_items.data.price'] });
+  if (!session || session.payment_status !== 'paid') return false;
+  return (session.line_items?.data || []).some(li => li.price && li.price.product === PRO_PRODUCT_ID);
+}
+
+async function verify(licenseKey) {
+  if (licenseKey.startsWith('cs_')) return sessionHasPro(licenseKey);
+  if (licenseKey.startsWith('pi_')) {
+    // A payment intent alone doesn't say what was bought; find its checkout session.
+    const list = await stripe.checkout.sessions.list({ payment_intent: licenseKey, limit: 1 });
+    return list.data[0] ? sessionHasPro(list.data[0].id) : false;
   }
+  return false;
+}
+
+const handler = async (req, res) => {
+  if (req.method !== 'POST') return res.status(405).json({ active: false, error: 'Method not allowed' });
+  const licenseKey = String((req.body && req.body.licenseKey) || '').trim();
+  if (!licenseKey) return res.status(400).json({ active: false, error: 'No license key provided.' });
+  if (!process.env.STRIPE_SECRET_KEY) return res.status(500).json({ active: false, error: 'License server is not configured.' });
 
   try {
-    const { licenseKey } = req.body;
-
-    if (!licenseKey) {
-      return res.status(400).json({ active: false, error: 'No license key provided.' });
-    }
-
-    if (!process.env.STRIPE_SECRET_KEY) {
-      return res.status(500).json({ active: false, error: 'Stripe is not configured on the server.' });
-    }
-
-    // Since it's a one-time purchase, we assume the licenseKey is a Checkout Session ID (cs_live_...) 
-    // or a Payment Intent ID (pi_...)
-    
-    // Check if it's a Checkout Session
-    if (licenseKey.startsWith('cs_')) {
-      const session = await stripe.checkout.sessions.retrieve(licenseKey);
-      if (session && session.payment_status === 'paid') {
-        return res.status(200).json({
-          active: true,
-          message: 'License is valid.'
-        });
-      }
-    }
-    
-    // Alternatively, check if it's a Payment Intent directly
-    if (licenseKey.startsWith('pi_')) {
-      const paymentIntent = await stripe.paymentIntents.retrieve(licenseKey);
-      if (paymentIntent && paymentIntent.status === 'succeeded') {
-        return res.status(200).json({
-          active: true,
-          message: 'License is valid.'
-        });
-      }
-    }
-
-    // If we reach here, it's either invalid format or not paid
-    return res.status(400).json({
-      active: false,
-      error: 'License key is invalid or payment has not been completed.'
-    });
-
+    if (await verify(licenseKey)) return res.status(200).json({ active: true, message: 'License is valid.' });
   } catch (error) {
-    console.error('License Verification Error:', error);
-    return res.status(500).json({ active: false, error: error.message || 'Internal Server Error' });
+    // Unknown IDs throw in Stripe; treat as invalid without leaking details.
+    if (error && error.type !== 'StripeInvalidRequestError') console.error('License verification error:', error.message);
   }
+  return res.status(400).json({ active: false, error: 'License key is invalid or payment has not been completed.' });
 };
 
 module.exports = allowCors(handler);
+module.exports.verify = verify;
